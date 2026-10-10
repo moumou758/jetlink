@@ -385,8 +385,8 @@ class TestWarp(unittest.TestCase):
   def test_an_hcq_capture_runs_the_kernel_step_alone(self):
     capture = FakeCapture(FakeOutput('QCOM'))
     hcq_call = SimpleNamespace(op='CALL', src=(SimpleNamespace(op='PROGRAM'),))
-    capture._linear.src = (capture._linear.src[0], capture._linear.src[1],
-                          SimpleNamespace(op='AFTER', src=(hcq_call,), without_after=hcq_call))
+    step0_wrapped = SimpleNamespace(op='AFTER', src=(capture._linear.src[0],), without_after=capture._linear.src[0])
+    capture._linear.src = (step0_wrapped, capture._linear.src[1], hcq_call)
     capture.linear = capture._linear
     realize = self.modules['tinygrad.engine.realize']
     realize.resolve_params = capture.resolve_params

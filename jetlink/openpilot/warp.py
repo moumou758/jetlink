@@ -227,6 +227,10 @@ class _HCQRunner:
     return self.ret
 
 
+def _step_ast(s):
+  return getattr(s, 'without_after', s).src[0]
+
+
 def _graph_alone(captured, inputs):
   """The capture's graph of warp kernels, and the QCOM buffers its two copy
   steps write the transforms into, as (3, 3) float32 views: tfm's, then
@@ -236,25 +240,23 @@ def _graph_alone(captured, inputs):
   from tinygrad.uop.ops import Ops
   linear = getattr(captured, 'linear', captured._linear)
   steps = linear.src
-  copies = [s for s in steps if s.src[0].op is Ops.COPY]
-  graphs = [s.src[0] for s in steps if s.src[0].op is Ops.CUSTOM_FUNCTION and s.src[0].arg == 'graph']
-  call_op = getattr(Ops, 'CALL', None)
-  hcqs = [s for s in steps if call_op is not None and s.src[0].op is not Ops.COPY
-          and (s.src[0].op is call_op or getattr(getattr(s, 'without_after', s), 'op', None) is call_op)]
-  if len(steps) != 3 or len(copies) != 2 or (len(graphs) != 1 and len(hcqs) != 1):
-    raise RuntimeError(f"the warp's capture is not two transform copies and a graph: {[s.src[0].op for s in steps]}")
+  copies = [s for s in steps if _step_ast(s).op is Ops.COPY]
+  non_copies = [s for s in steps if _step_ast(s).op is not Ops.COPY]
+  if len(steps) != 3 or len(copies) != 2 or len(non_copies) != 1:
+    raise RuntimeError(f"the warp's capture is not two transform copies and a graph: {[_step_ast(s).op for s in steps]}")
   views = {}
   for step in copies:
-    dest, src = resolve_params(step, inputs)
+    call = getattr(step, 'without_after', step)
+    dest, src = resolve_params(call, inputs)
     name = WARP_INPUT_NAMES[next(i for i, u in enumerate(inputs) if u is src)]
     buf = dest.buffer.ensure_allocated() if hasattr(dest.buffer, 'ensure_allocated') else dest.buffer
     views[name] = np.frombuffer(buf.as_memoryview(force_zero_copy=True), dtype=np.float32).reshape(3, 3)
-  if graphs:
+  ast = _step_ast(non_copies[0])
+  if ast.op is Ops.CUSTOM_FUNCTION and getattr(ast, 'arg', None) == 'graph':
     from tinygrad.engine.realize import get_graph_runtime
-    runner = get_graph_runtime(graphs[0], inputs)
+    runner = get_graph_runtime(ast, inputs)
   else:
-    step_idx = next(i for i, s in enumerate(steps) if s.src[0].op is not Ops.COPY)
-    runner = _HCQRunner(linear.src[step_idx], captured.ret)
+    runner = _HCQRunner(non_copies[0], captured.ret)
   return runner, views['tfm'], views['big_tfm']
 
 
