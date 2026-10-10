@@ -195,7 +195,9 @@ class Warp:
     self._replay = jit.captured
     if self._device.startswith('QCOM'):
       inputs = (blobs[1].uop.base, self._big_tfm_buf, blobs[0].uop.base, self._tfm_buf)
-      self._replay, self._tfm, self._big_tfm = _graph_alone(jit.captured, inputs)
+      graph_alone = _graph_alone(jit.captured, inputs)
+      if graph_alone is not None:
+        self._replay, self._tfm, self._big_tfm = graph_alone
 
   def start(self, frame: int, big_frame: int, tfm, big_tfm) -> None:
     """Warp the camera buffers at these addresses under their transforms.
@@ -215,18 +217,6 @@ class Warp:
     return tensor.uop.base
 
 
-class _HCQRunner:
-  def __init__(self, step, ret):
-    from tinygrad.uop.ops import UOp, Ops
-    self.linear = UOp(Ops.LINEAR, src=(step,))
-    self.ret = ret
-
-  def __call__(self, input_uops, var_vals=None):
-    from tinygrad.engine.realize import run_linear
-    run_linear(self.linear, var_vals or {}, input_uops=input_uops, update_stats=False, jit=True)
-    return self.ret
-
-
 def _step_ast(s):
   return getattr(s, 'without_after', s).src[0]
 
@@ -234,9 +224,8 @@ def _step_ast(s):
 def _graph_alone(captured, inputs):
   """The capture's graph of warp kernels, and the QCOM buffers its two copy
   steps write the transforms into, as (3, 3) float32 views: tfm's, then
-  big_tfm's. Raises unless the capture is those three steps."""
-  import numpy as np
-  from tinygrad.engine.realize import resolve_params
+  big_tfm's. Raises unless the capture is those three steps. Returns None if the
+  graph is an HCQ batch (which must replay as a whole capture with its dependencies)."""
   from tinygrad.uop.ops import Ops
   linear = getattr(captured, 'linear', captured._linear)
   steps = linear.src
@@ -244,20 +233,20 @@ def _graph_alone(captured, inputs):
   non_copies = [s for s in steps if _step_ast(s).op is not Ops.COPY]
   if len(steps) != 3 or len(copies) != 2 or len(non_copies) != 1:
     raise RuntimeError(f"the warp's capture is not two transform copies and a graph: {[_step_ast(s).op for s in steps]}")
-  views = {}
-  for step in copies:
-    call = getattr(step, 'without_after', step)
-    dest, src = resolve_params(call, inputs)
-    name = WARP_INPUT_NAMES[next(i for i, u in enumerate(inputs) if u is src)]
-    buf = dest.buffer.ensure_allocated() if hasattr(dest.buffer, 'ensure_allocated') else dest.buffer
-    views[name] = np.frombuffer(buf.as_memoryview(force_zero_copy=True), dtype=np.float32).reshape(3, 3)
   ast = _step_ast(non_copies[0])
   if ast.op is Ops.CUSTOM_FUNCTION and getattr(ast, 'arg', None) == 'graph':
-    from tinygrad.engine.realize import get_graph_runtime
+    import numpy as np
+    from tinygrad.engine.realize import get_graph_runtime, resolve_params
+    views = {}
+    for step in copies:
+      call = getattr(step, 'without_after', step)
+      dest, src = resolve_params(call, inputs)
+      name = WARP_INPUT_NAMES[next(i for i, u in enumerate(inputs) if u is src)]
+      buf = dest.buffer.ensure_allocated() if hasattr(dest.buffer, 'ensure_allocated') else dest.buffer
+      views[name] = np.frombuffer(buf.as_memoryview(force_zero_copy=True), dtype=np.float32).reshape(3, 3)
     runner = get_graph_runtime(ast, inputs)
-  else:
-    runner = _HCQRunner(non_copies[0], captured.ret)
-  return runner, views['tfm'], views['big_tfm']
+    return runner, views['tfm'], views['big_tfm']
+  return None
 
 
 def _make_coherent(out) -> None:
