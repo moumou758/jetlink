@@ -215,24 +215,46 @@ class Warp:
     return tensor.uop.base
 
 
+class _HCQRunner:
+  def __init__(self, step, ret):
+    from tinygrad.uop.ops import UOp, Ops
+    self.linear = UOp(Ops.LINEAR, src=(step,))
+    self.ret = ret
+
+  def __call__(self, input_uops, var_vals=None):
+    from tinygrad.engine.realize import run_linear
+    run_linear(self.linear, var_vals or {}, input_uops=input_uops, update_stats=False, jit=True)
+    return self.ret
+
+
 def _graph_alone(captured, inputs):
   """The capture's graph of warp kernels, and the QCOM buffers its two copy
   steps write the transforms into, as (3, 3) float32 views: tfm's, then
   big_tfm's. Raises unless the capture is those three steps."""
   import numpy as np
-  from tinygrad.engine.realize import get_graph_runtime, resolve_params
+  from tinygrad.engine.realize import resolve_params
   from tinygrad.uop.ops import Ops
   steps = captured._linear.src
   copies = [s for s in steps if s.src[0].op is Ops.COPY]
   graphs = [s.src[0] for s in steps if s.src[0].op is Ops.CUSTOM_FUNCTION and s.src[0].arg == 'graph']
-  if len(steps) != 3 or len(copies) != 2 or len(graphs) != 1:
+  call_op = getattr(Ops, 'CALL', None)
+  hcqs = [s for s in steps if call_op is not None and s.src[0].op is not Ops.COPY
+          and (s.src[0].op is call_op or getattr(getattr(s, 'without_after', s), 'op', None) is call_op)]
+  if len(steps) != 3 or len(copies) != 2 or (len(graphs) != 1 and len(hcqs) != 1):
     raise RuntimeError(f"the warp's capture is not two transform copies and a graph: {[s.src[0].op for s in steps]}")
   views = {}
   for step in copies:
     dest, src = resolve_params(step, inputs)
     name = WARP_INPUT_NAMES[next(i for i, u in enumerate(inputs) if u is src)]
     views[name] = np.frombuffer(dest.buffer.as_memoryview(force_zero_copy=True), dtype=np.float32).reshape(3, 3)
-  return get_graph_runtime(graphs[0], inputs), views['tfm'], views['big_tfm']
+  if graphs:
+    from tinygrad.engine.realize import get_graph_runtime
+    runner = get_graph_runtime(graphs[0], inputs)
+  else:
+    step_idx = next(i for i, s in enumerate(steps) if s.src[0].op is not Ops.COPY)
+    linear = getattr(captured, 'linear', captured._linear)
+    runner = _HCQRunner(linear.src[step_idx], captured.ret)
+  return runner, views['tfm'], views['big_tfm']
 
 
 def _make_coherent(out) -> None:

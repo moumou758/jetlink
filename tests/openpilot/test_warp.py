@@ -319,8 +319,10 @@ class TestWarp(unittest.TestCase):
     modules['tinygrad.tensor'].Tensor = UopTensor
     modules['tinygrad.uop'] = ModuleType('tinygrad.uop')
     modules['tinygrad.uop.ops'] = ModuleType('tinygrad.uop.ops')
-    modules['tinygrad.uop.ops'].Ops = SimpleNamespace(COPY='COPY', CUSTOM_FUNCTION='CUSTOM_FUNCTION')
+    modules['tinygrad.uop.ops'].Ops = SimpleNamespace(COPY='COPY', CUSTOM_FUNCTION='CUSTOM_FUNCTION', CALL='CALL', LINEAR='LINEAR')
+    modules['tinygrad.uop.ops'].UOp = lambda op, src=(): SimpleNamespace(op=op, src=src)
     modules['tinygrad.engine.realize'] = ModuleType('tinygrad.engine.realize')
+    modules['tinygrad.engine.realize'].run_linear = mock.Mock()
     p = mock.patch.dict(sys.modules, modules)
     p.start()
     self.addCleanup(p.stop)
@@ -376,6 +378,31 @@ class TestWarp(unittest.TestCase):
     big_frame, _, frame, _ = bufs   # sorted names, as the capture took them
     self.assertEqual((frame.ptr, big_frame.ptr), (0x1000, 0x2000))
     self.assertEqual((frame.shape, frame.device), ((1234,), 'QCOM'))
+    np.testing.assert_array_equal(capture.tfm('tfm'), tfm)
+    np.testing.assert_array_equal(capture.tfm('big_tfm'), big_tfm)
+    self.assertEqual(len(capture.calls), 2, 'no call through TinyJit after the warm-up')
+
+  def test_an_hcq_capture_runs_the_kernel_step_alone(self):
+    capture = FakeCapture(FakeOutput('QCOM'))
+    hcq_call = SimpleNamespace(op='CALL', src=(SimpleNamespace(op='PROGRAM'),))
+    capture._linear.src = (capture._linear.src[0], capture._linear.src[1],
+                          SimpleNamespace(op='AFTER', src=(hcq_call,), without_after=hcq_call))
+    capture.linear = capture._linear
+    realize = self.modules['tinygrad.engine.realize']
+    realize.resolve_params = capture.resolve_params
+    run_linear_mock = mock.Mock()
+    realize.run_linear = run_linear_mock
+    jit = mock.Mock(side_effect=capture.jit)
+    jit.captured = capture
+    w = warp.Warp(jit, 1234, self.log)
+    tfm, big_tfm = np.eye(3) * 2, np.eye(3) * 3
+    w.start(0x1000, 0x2000, tfm, big_tfm)
+    run_linear_mock.assert_called_once()
+    _, kwargs = run_linear_mock.call_args
+    self.assertEqual(kwargs['input_uops'][0].ptr, 0x2000)
+    self.assertEqual(kwargs['input_uops'][2].ptr, 0x1000)
+    self.assertFalse(kwargs['update_stats'])
+    self.assertTrue(kwargs['jit'])
     np.testing.assert_array_equal(capture.tfm('tfm'), tfm)
     np.testing.assert_array_equal(capture.tfm('big_tfm'), big_tfm)
     self.assertEqual(len(capture.calls), 2, 'no call through TinyJit after the warm-up')
