@@ -234,7 +234,8 @@ def _graph_alone(captured, inputs):
   import numpy as np
   from tinygrad.engine.realize import resolve_params
   from tinygrad.uop.ops import Ops
-  steps = captured._linear.src
+  linear = getattr(captured, 'linear', captured._linear)
+  steps = linear.src
   copies = [s for s in steps if s.src[0].op is Ops.COPY]
   graphs = [s.src[0] for s in steps if s.src[0].op is Ops.CUSTOM_FUNCTION and s.src[0].arg == 'graph']
   call_op = getattr(Ops, 'CALL', None)
@@ -246,13 +247,13 @@ def _graph_alone(captured, inputs):
   for step in copies:
     dest, src = resolve_params(step, inputs)
     name = WARP_INPUT_NAMES[next(i for i, u in enumerate(inputs) if u is src)]
-    views[name] = np.frombuffer(dest.buffer.as_memoryview(force_zero_copy=True), dtype=np.float32).reshape(3, 3)
+    buf = dest.buffer.ensure_allocated() if hasattr(dest.buffer, 'ensure_allocated') else dest.buffer
+    views[name] = np.frombuffer(buf.as_memoryview(force_zero_copy=True), dtype=np.float32).reshape(3, 3)
   if graphs:
     from tinygrad.engine.realize import get_graph_runtime
     runner = get_graph_runtime(graphs[0], inputs)
   else:
     step_idx = next(i for i, s in enumerate(steps) if s.src[0].op is not Ops.COPY)
-    linear = getattr(captured, 'linear', captured._linear)
     runner = _HCQRunner(linear.src[step_idx], captured.ret)
   return runner, views['tfm'], views['big_tfm']
 
